@@ -900,6 +900,7 @@ start_cluster() {
     fi
 
     # Build docker run arguments based on mode
+
     local docker_entrypoint_args=""
     if [[ "$KEEP_ENTRYPOINT" != "true" ]]; then
         docker_entrypoint_args="--entrypoint="
@@ -913,7 +914,7 @@ start_cluster() {
         done
     fi
 
-    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_args_common="--gpus all -d --rm --init $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
