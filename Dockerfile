@@ -775,6 +775,7 @@ RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
+    ffmpeg libsndfile1 \
     libxcb1 \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
@@ -822,12 +823,178 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 # Final extra deps
 # Pin torch via --override so transitive deps (e.g. instanttensor) can't trigger
 # a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
+# Install vLLM-Omni from GitHub because the PyPI release currently lags the
+# vLLM wheel API used by this image.
+ARG VLLM_OMNI_REF=v0.23.0rc1
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     PINNED_TORCH=$(python3 -c "import torch; print(torch.__version__)") && \
     echo "torch==${PINNED_TORCH}" > /tmp/torch-override.txt && \
     echo "fastapi[standard]>=0.115.0,<0.137.0" >> /tmp/torch-override.txt && \
     uv pip install ray[default] fastsafetensors instanttensor \
+        "mistral-common[audio]>=1.9.0" \
+        "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@${VLLM_OMNI_REF}" \
+        av scipy soundfile soxr librosa \
         --override /tmp/torch-override.txt
+
+RUN python3 - <<'PY'
+import importlib
+import shutil
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+
+missing_bins = [name for name in ("ffmpeg", "ffprobe") if shutil.which(name) is None]
+if missing_bins:
+    raise RuntimeError(f"Missing audio tools: {', '.join(missing_bins)}")
+
+for module in ("av", "librosa", "mistral_common", "scipy", "soxr", "soundfile"):
+    importlib.import_module(module)
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    path = Path(tmpdir) / "audio-smoke.wav"
+    sf.write(path, np.zeros(1600, dtype=np.float32), 16000)
+    samples, sample_rate = sf.read(path, dtype="float32")
+    assert sample_rate == 16000
+    assert samples.shape[0] == 1600
+PY
+
+# Patch vLLM-Omni v0.23.0rc1 Request wrapper for newer vLLM 0.23.1
+# Request construction. This mirrors the upstream fix on vLLM-Omni main while
+# keeping the package version on the 0.23.x line.
+RUN python3 - <<'PYOMNI'
+from pathlib import Path
+
+path = Path("/usr/local/lib/python3.12/dist-packages/vllm_omni/request.py")
+text = path.read_text()
+old = """    def __init__(
+        self,
+        prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
+        # Optional external request ID for tracking
+        external_req_id: str | None = None,
+        additional_information: AdditionalInformationPayload | None = None,
+        *args,
+        **kwargs,
+    ):
+        prompt_embeds_tensor = self._maybe_decode_prompt_embeds(prompt_embeds)
+        super().__init__(prompt_embeds=prompt_embeds_tensor, *args, **kwargs)
+"""
+new = """    def __init__(
+        self,
+        *args,
+        prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
+        # Optional external request ID for tracking
+        external_req_id: str | None = None,
+        additional_information: AdditionalInformationPayload | None = None,
+        **kwargs,
+    ):
+        if prompt_embeds is not None:
+            kwargs["prompt_embeds"] = self._maybe_decode_prompt_embeds(prompt_embeds)
+        super().__init__(*args, **kwargs)
+"""
+if old in text:
+    path.write_text(text.replace(old, new))
+elif "kwargs[\"prompt_embeds\"] = self._maybe_decode_prompt_embeds(prompt_embeds)" not in text:
+    raise RuntimeError("vLLM-Omni Request wrapper shape changed; update Dockerfile patch")
+PYOMNI
+
+# Compatibility shims for vllm-omni releases that lag current vLLM internal
+# API names. Keep these idempotent so they become no-ops as upstream catches up.
+RUN python3 - <<'PYSHIM'
+from pathlib import Path
+
+
+def append_if_missing(file_path: str, marker: str, addition: str) -> None:
+    path = Path(file_path)
+    if not path.exists():
+        print(f"Skipping missing vLLM compatibility target: {path}")
+        return
+    text = path.read_text()
+    if marker not in text:
+        path.write_text(text + addition)
+
+
+append_if_missing(
+    "/usr/local/lib/python3.12/dist-packages/vllm/utils/torch_utils.py",
+    "def supports_xccl(",
+    """
+
+
+def supports_xccl() -> bool:
+    # Return whether PyTorch exposes an available XCCL backend.
+    try:
+        import torch
+
+        distributed = getattr(torch, "distributed", None)
+        if distributed is None or not distributed.is_available():
+            return False
+        is_xccl_available = getattr(distributed, "is_xccl_available", None)
+        return bool(is_xccl_available()) if callable(is_xccl_available) else False
+    except Exception:
+        return False
+""",
+)
+
+append_if_missing(
+    "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/serve/tokenize/serving.py",
+    "OpenAIServingTokenization = ServingTokenization",
+    "\n\nOpenAIServingTokenization = ServingTokenization\n",
+)
+
+chat_like_import = "from vllm.entrypoints.serve.engine.typing import ChatLikeRequest"
+append_if_missing(
+    "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/engine/serving.py",
+    chat_like_import,
+    f"\n\n{chat_like_import}\n",
+)
+
+append_if_missing(
+    "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/parser/harmony_utils.py",
+    "def parse_chat_output(",
+    r"""
+
+
+def _compat_message_text(message):
+    content = getattr(message, "content", None)
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for item in content:
+        text = getattr(item, "text", None)
+        if text is not None:
+            parts.append(text)
+        elif isinstance(item, dict):
+            parts.append(str(item.get("text", "")))
+    return "".join(parts)
+
+
+def parse_chat_output(token_ids):
+    # Compatibility wrapper for vllm-omni's older Harmony helper import.
+    try:
+        messages = get_encoding().parse_messages_from_completion_tokens(
+            token_ids, Role.ASSISTANT, strict=False
+        )
+    except Exception:
+        return None, get_encoding().decode(token_ids), None
+
+    reasoning_parts = []
+    content_parts = []
+    for message in messages:
+        text = _compat_message_text(message)
+        if getattr(message, "channel", None) == "analysis":
+            reasoning_parts.append(text)
+        else:
+            content_parts.append(text)
+
+    reasoning = "".join(reasoning_parts) or None
+    content = "".join(content_parts)
+    return reasoning, content, None
+""",
+)
+PYSHIM
 
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \

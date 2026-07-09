@@ -1,0 +1,47 @@
+# Recipe: Gemma4-E4B-it-Audio
+# Audio-capable Gemma 4 E4B instruction model.
+
+recipe_version: "1"
+name: Gemma4-E4B-it-Audio
+description: vLLM serving google/gemma-4-E4B-it with audio-capable multimodal chat input
+
+# HuggingFace model to download (optional, for --setup)
+model: google/gemma-4-E4B-it
+
+cluster_only: false
+solo_only: false
+
+# Container image to use. The TF5 image includes current Gemma 4 support.
+container: vllm-node
+
+mods:
+  - mods/gemma4-audio-chat-template
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.3
+  max_model_len: 16384
+  max_num_batched_tokens: 8192
+  max_num_seqs: 1
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template.
+# Gemma 4 E2B/E4B support audio input; keep audio clips <= 30s and place
+# audio content after the text instruction in chat messages.
+command: |
+  vllm serve google/gemma-4-E4B-it \
+    --port {port} \
+    --host {host} \
+    --chat-template gemma4_audio_chat_template.jinja \
+    --reasoning-parser gemma4 \
+    --tool-call-parser gemma4 \
+    --enable-auto-tool-choice \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    -tp {tensor_parallel}
