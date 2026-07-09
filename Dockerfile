@@ -79,7 +79,7 @@ WORKDIR $VLLM_BASE_DIR
 #     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
 #     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
-RUN git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git && \
+RUN git clone https://github.com/NVIDIA/nccl.git && \
     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./build/pkg/deb/*.deb
 
@@ -191,6 +191,19 @@ COPY --from=flashinfer-builder /workspace/wheels /
 # STAGE 4: vLLM Builder
 # =========================================================
 FROM base AS vllm-builder
+ARG RUSTUP_TOOLCHAIN=stable
+ENV RUSTUP_HOME=/opt/rustup
+ENV CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH
+ENV PROTOC_INCLUDE=/usr/include
+
+RUN apt update && \
+    apt install -y --no-install-recommends ca-certificates pkg-config protobuf-compiler libprotobuf-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+      sh -s -- -y --profile minimal --default-toolchain ${RUSTUP_TOOLCHAIN} --no-modify-path && \
+    rustc --version && \
+    cargo --version
 
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
@@ -253,7 +266,11 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-ARG VLLM_PRESET_PRS=""
+# Temporary upstream fixes carried until they are present in the pinned vLLM ref.
+# See https://github.com/vllm-project/vllm/pull/47445
+# See https://github.com/vllm-project/vllm/pull/47392
+# See https://github.com/vllm-project/vllm/pull/47618
+ARG VLLM_PRESET_PRS="47445 47392 47618"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
@@ -299,6 +316,58 @@ RUN set -eux; \
             fi; \
         done; \
     fi
+
+# TEMPORARY PATCH: vLLM PR #47914 added per-KV-group causal metadata by
+# treating non-bool causal as Mapping[int, bool]. DiffusionGemma passes a
+# per-request torch.Tensor causal mask and crashes on causal.get(...). Keep this
+# until upstream build_attn_metadata accepts Tensor causal again.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/v1/worker/gpu/attn_utils.py")
+bad_signature = "causal: bool | Mapping[int, bool] = True,"
+fixed_signature = "causal: bool | Mapping[int, bool] | torch.Tensor = True,"
+bad_group_causal = (
+    "        group_causal = causal if isinstance(causal, bool) else "
+    "causal.get(i, True)"
+)
+fixed_group_causal = """        if isinstance(causal, (bool, torch.Tensor)):
+            group_causal = causal
+        else:
+            group_causal = causal.get(i, True)"""
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot apply DiffusionGemma causal patch")
+
+text = target.read_text()
+if fixed_signature in text and fixed_group_causal in text:
+    print("DiffusionGemma Tensor causal workaround already present; skipping")
+elif bad_signature in text and bad_group_causal in text:
+    text = text.replace(bad_signature, fixed_signature, 1)
+    text = text.replace(bad_group_causal, fixed_group_causal, 1)
+    target.write_text(text)
+    print("Applied DiffusionGemma Tensor causal workaround for vLLM PR #47914")
+else:
+    print("Known vLLM PR #47914 causal regression pattern not found; skipping")
+PY
+
+# TEMPORARY PATCH: vLLM PR #43957 added a generic embedding-width guard for
+# EAGLE3, but Gemma4 MTP intentionally replaces its draft embedding with the
+# target backbone embedding before pre_projection. Without sharing, Gemma4 MTP
+# concatenates 1024-wide draft embeddings with 2816-wide backbone hidden states
+# and crashes in a 5632-wide pre_projection. Keep the guard scoped to EAGLE-style
+# draft models until upstream fixes https://github.com/vllm-project/vllm/issues/47794.
+RUN patch -p1 <<'PATCH'
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -1472,4 +1472,4 @@ class SpecDecodeBaseProposer:
+-            if share_embeddings:
++            if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):
+                 draft_embed = self.model.model.embed_tokens
+                 # Only share when both models use the same embedding width.
+                 # Guard with isinstance so non-Tensor weights (e.g. in tests)
+PATCH
 
 # TEMPORARY PATCH (source build only): vLLM PR #43008 selects cooperative_topk
 # for all SM90+ devices. On DGX Spark / SM12.x this fails at launch with
@@ -463,13 +532,181 @@ else:
         print("Known vulnerable RoutedExperts _load_single_value pattern not found; skipping")
 PY
 
+# DGX Spark UMA cleanup: profile warmup can leave temporary CUDA allocator
+# reservations behind just before vLLM sizes and allocates KV cache blocks.
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+target = Path("vllm/v1/worker/gpu_worker.py")
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot apply KV cache cleanup patch")
+
+text = target.read_text()
+lines = text.splitlines(keepends=True)
+changed = False
+
+profile_cleanup_present = (
+    "profile_result.after_profile.measure()" in text
+    and "diff_from_create.non_torch_memory" in text
+)
+prealloc_cleanup_present = (
+    "memory_reserved(self.device)" in text
+    and "memory_allocated(self.device)" in text
+    and "empty_cache()" in text
+)
+needs_cleanup = not (profile_cleanup_present and prealloc_cleanup_present)
+
+if needs_cleanup and not re.search(r"(?m)^import gc$", text):
+    insert_at = None
+    last_future_import = None
+    for i, line in enumerate(lines):
+        if line.startswith("from __future__ import "):
+            last_future_import = i
+        elif insert_at is None and (
+            line.startswith("import ") or line.startswith("from ")
+        ):
+            insert_at = i
+    if last_future_import is not None:
+        lines.insert(last_future_import + 1, "import gc\n")
+    elif insert_at is not None:
+        lines.insert(insert_at, "import gc\n")
+    else:
+        lines.insert(0, "import gc\n")
+    changed = True
+
+
+def find_line(pattern: str) -> tuple[int, re.Match[str]]:
+    regex = re.compile(pattern)
+    for index, line in enumerate(lines):
+        match = regex.match(line)
+        if match:
+            return index, match
+    raise SystemExit(f"Could not find expected vLLM pattern: {pattern}")
+
+
+def insert_after_docstring(func_index: int, func_indent: str, block: list[str]) -> None:
+    insert_at = func_index + 1
+    if insert_at < len(lines):
+        stripped = lines[insert_at].lstrip()
+        quote = None
+        if stripped.startswith(chr(34) * 3):
+            quote = chr(34) * 3
+        elif stripped.startswith(chr(39) * 3):
+            quote = chr(39) * 3
+
+        if quote is not None:
+            if stripped.count(quote) >= 2 and not stripped.startswith(quote * 2):
+                insert_at += 1
+            else:
+                insert_at += 1
+                while insert_at < len(lines):
+                    if quote in lines[insert_at]:
+                        insert_at += 1
+                        break
+                    insert_at += 1
+
+    lines[insert_at:insert_at] = block
+
+
+if not profile_cleanup_present:
+    snapshot_line = (
+        r"^(?P<indent>[ \t]+)free_gpu_memory = "
+        r"profile_result\.after_profile\.free_memory\n$"
+    )
+    index, match = find_line(snapshot_line)
+    indent = match.group("indent")
+    lines[index:index] = [
+        f"{indent}# spark-vllm-docker: post-profile cleanup before KV sizing\n",
+        f'{indent}if self.device_config.device_type == "cuda":\n',
+        f"{indent}    before_cleanup = profile_result.after_profile.free_memory\n",
+        f'{indent}    if hasattr(self.model_runner, "_cleanup_profiling_kv_cache"):\n',
+        f"{indent}        self.model_runner._cleanup_profiling_kv_cache()\n",
+        f"{indent}    gc.collect()\n",
+        f"{indent}    torch.cuda.synchronize(self.device)\n",
+        f"{indent}    torch.cuda.empty_cache()\n",
+        f"{indent}    profile_result.after_profile.measure()\n",
+        f"{indent}    diff_from_create = (\n",
+        f"{indent}        profile_result.after_profile - profile_result.before_create\n",
+        f"{indent}    )\n",
+        f"{indent}    profile_result.non_torch_increase = (\n",
+        f"{indent}        diff_from_create.non_torch_memory\n",
+        f"{indent}    )\n",
+        f"{indent}    profile_result.non_kv_cache_memory = (\n",
+        f"{indent}        profile_result.non_torch_increase\n",
+        f"{indent}        + profile_result.torch_peak_increase\n",
+        f"{indent}        + profile_result.weights_memory\n",
+        f"{indent}    )\n",
+        f"{indent}    cleanup_freed = (\n",
+        f"{indent}        profile_result.after_profile.free_memory - before_cleanup\n",
+        f"{indent}    )\n",
+        f"{indent}    if cleanup_freed > 0:\n",
+        f"{indent}        logger.info_once(\n",
+        f'{indent}            "Freed %.2f GiB before KV cache sizing; "\n',
+        f'{indent}            "non-torch profile increase is %.2f GiB.",\n',
+        f"{indent}            cleanup_freed / (1024**3),\n",
+        f"{indent}            profile_result.non_torch_increase / (1024**3),\n",
+        f"{indent}        )\n",
+        "\n",
+    ]
+    changed = True
+
+if not prealloc_cleanup_present:
+    func_index = None
+    func_indent = None
+    for i, line in enumerate(lines):
+        match = re.match(
+            r"^(?P<indent>[ \t]+)def initialize_from_config"
+            r"\(self,\s*kv_cache_config\b",
+            line,
+        )
+        if match:
+            func_index = i
+            func_indent = match.group("indent")
+            break
+
+    if func_index is None or func_indent is None:
+        raise SystemExit("Could not find initialize_from_config in vLLM gpu_worker.py")
+
+    body_indent = func_indent + "    "
+    block = [
+        f"{body_indent}# spark-vllm-docker: pre-KV cache allocator cleanup\n",
+        f'{body_indent}if self.device_config.device_type == "cuda":\n',
+        f"{body_indent}    gc.collect()\n",
+        f"{body_indent}    torch.cuda.synchronize(self.device)\n",
+        f"{body_indent}    cached_memory = max(\n",
+        f"{body_indent}        torch.cuda.memory_reserved(self.device)\n",
+        f"{body_indent}        - torch.cuda.memory_allocated(self.device),\n",
+        f"{body_indent}        0,\n",
+        f"{body_indent}    )\n",
+        f"{body_indent}    torch.cuda.empty_cache()\n",
+        f"{body_indent}    if cached_memory > 0:\n",
+        f"{body_indent}        logger.info_once(\n",
+        f'{body_indent}            "Cleared %.2f GiB of cached CUDA allocator memory before "\n',
+        f'{body_indent}            "KV cache allocation.",\n',
+        f"{body_indent}            cached_memory / (1024**3),\n",
+        f"{body_indent}        )\n",
+        "\n",
+    ]
+    insert_after_docstring(func_index, func_indent, block)
+    changed = True
+
+if changed:
+    target.write_text("".join(lines))
+    print("Applied Spark KV cache cleanup patch")
+else:
+    print("Equivalent Spark KV cache cleanup already present; skipping")
+PY
+
+
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
     sed -i '/^triton\b/d' requirements/test/cuda.txt && \
     sed -i '/^fastsafetensors\b/d' requirements/test/cuda.txt && \
-    uv pip install -r requirements/build/cuda.txt
+    uv pip install -r requirements/build/cuda.txt "setuptools-rust>=1.9.0"
 
 # Apply Patches
 # TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180
@@ -486,8 +723,14 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
-    # dump git ref in the wheels dir
+    --mount=type=cache,id=cargo-registry,target=/opt/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/opt/cargo/git \
+    --mount=type=cache,id=vllm-rust-target,target=/workspace/vllm/vllm/target \
+    VLLM_REQUIRE_RUST_FRONTEND=1 CARGO_BUILD_JOBS=${MAX_JOBS} \
+    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v
+
+# Dump git refs in the wheels dir.
+RUN \
     git rev-parse HEAD > /workspace/wheels/.vllm-commit && \
     git -C "$DEEPGEMM_SRC_DIR" rev-parse HEAD > /workspace/wheels/.deepgemm-commit
 
@@ -553,7 +796,7 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
-# With --tf5: override vLLM's transformers<5 constraint to get transformers>=5
+# PRE_TRANSFORMERS=1 is retained for manual legacy builds; build-and-copy.sh no longer sets it for --tf5.
 # FastAPI 0.137.0 adds _IncludedRouter entries that currently break
 # prometheus-fastapi-instrumentator route name lookup.
 RUN --mount=type=bind,source=wheels,target=/workspace/wheels \
