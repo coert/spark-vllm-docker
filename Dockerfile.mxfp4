@@ -243,8 +243,8 @@ ENV UV_LINK_MODE=copy
 # Note: "devel" tools like cmake/gcc are NOT installed here to save space
 RUN apt update && \
     apt install -y --no-install-recommends \
-    curl vim git \
     ffmpeg libsndfile1 \
+    curl vim git earlyoom \
     libxcb1 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv && pip uninstall -y flash-attn 
