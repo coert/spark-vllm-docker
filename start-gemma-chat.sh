@@ -2,6 +2,11 @@
 set -euo pipefail
 
 MODEL="${1:-${GEMMA4_MODEL:-google/gemma-4-E4B-it}}"
+
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
 VLLM_IMAGE="${VLLM_IMAGE:-vllm-node}"
 VLLM_CONTAINER_NAME="${VLLM_CONTAINER_NAME:-vllm_gemma4_node}"
 VLLM_PORT="${VLLM_PORT:-8000}"
@@ -11,6 +16,7 @@ VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-16384}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1}"
 VLLM_TENSOR_PARALLEL="${VLLM_TENSOR_PARALLEL:-1}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEMMA_CHAT_TEMPLATE_HOST="${SCRIPT_DIR}/tool_chat_template_gemma4.jinja"
 GEMMA_CHAT_TEMPLATE_CONTAINER="/tmp/tool_chat_template_gemma4.jinja"
